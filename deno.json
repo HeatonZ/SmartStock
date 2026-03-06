@@ -1,0 +1,31 @@
+{
+  "tasks": {
+    "dev": "deno run -A tools/dev.ts",
+    "api:dev": "deno run --watch -A apps/api/main.ts",
+    "web:dev": "deno run -A jsr:@std/http/file-server apps/web --port 5173",
+    "db:init": "deno run -A apps/api/scripts/db_init.ts",
+    "db:seed": "deno run -A apps/api/scripts/db_seed.ts",
+    "test:api": "deno run -A apps/api/scripts/test_api.ts",
+    "test": "deno test -A --no-check apps/api/src packages"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.13",
+    "@std/dotenv": "jsr:@std/dotenv@^0.225.5",
+    "@std/http": "jsr:@std/http@^1.0.21",
+    "@api/": "./apps/api/",
+    "@shared/": "./packages/shared-types/",
+    "@ai/": "./packages/ai-provider/"
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "semiColons": true,
+    "singleQuote": true
+  },
+  "lint": {
+    "rules": {
+      "tags": [
+        "recommended"
+      ]
+    }
+  }
+}
