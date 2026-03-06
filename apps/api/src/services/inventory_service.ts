@@ -208,29 +208,65 @@ export async function deductInventory(params: {
 }
 
 export async function getLast7DayProductStats() {
-  const result = await pool.query(
+  const productsResult = await pool.query(
     `SELECT
       p.id AS product_id,
       p.sku,
       p.name,
       p.safety_stock,
-      i.available_qty,
-      COALESCE(SUM(CASE WHEN l.created_at >= NOW() - INTERVAL '7 days' THEN l.delta_qty ELSE 0 END), 0) AS seven_day_net_delta,
-      COALESCE(SUM(CASE WHEN l.created_at >= NOW() - INTERVAL '7 days' AND l.delta_qty < 0 THEN -l.delta_qty ELSE 0 END), 0) AS seven_day_outflow
+      i.available_qty
     FROM products p
     JOIN inventories i ON i.product_id = p.id
-    LEFT JOIN inventory_logs l ON l.product_id = p.id
-    GROUP BY p.id, p.sku, p.name, p.safety_stock, i.available_qty
     ORDER BY p.created_at ASC`,
   );
 
-  return result.rows.map((row) => ({
-    productId: String(row.product_id),
-    sku: String(row.sku),
-    name: String(row.name),
-    safetyStock: Number(row.safety_stock),
-    currentStock: Number(row.available_qty),
-    sevenDayNetDelta: Number(row.seven_day_net_delta),
-    sevenDayOutflow: Number(row.seven_day_outflow),
-  }));
+  const dailyResult = await pool.query(
+    `SELECT
+      l.product_id,
+      DATE(l.created_at) AS day,
+      SUM(l.delta_qty) AS net_delta,
+      SUM(CASE WHEN l.delta_qty < 0 THEN -l.delta_qty ELSE 0 END) AS outflow
+    FROM inventory_logs l
+    WHERE l.created_at >= CURRENT_DATE - INTERVAL '6 days'
+    GROUP BY l.product_id, DATE(l.created_at)`,
+  );
+
+  const dayKeys = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date();
+    day.setHours(0, 0, 0, 0);
+    day.setDate(day.getDate() - (6 - index));
+    return day.toISOString().slice(0, 10);
+  });
+
+  const dayStats = new Map<string, Map<string, { netDelta: number; outflow: number }>>();
+  for (const row of dailyResult.rows) {
+    const productId = String(row.product_id);
+    const day = new Date(String(row.day)).toISOString().slice(0, 10);
+    if (!dayStats.has(productId)) {
+      dayStats.set(productId, new Map());
+    }
+    dayStats.get(productId)!.set(day, {
+      netDelta: Number(row.net_delta),
+      outflow: Number(row.outflow),
+    });
+  }
+
+  return productsResult.rows.map((row) => {
+    const productId = String(row.product_id);
+    const productDayStats = dayStats.get(productId) ?? new Map<string, { netDelta: number; outflow: number }>();
+    const recentDailyNetDeltas = dayKeys.map((day) => productDayStats.get(day)?.netDelta ?? 0);
+    const sevenDayNetDelta = recentDailyNetDeltas.reduce((sum, value) => sum + value, 0);
+    const sevenDayOutflow = dayKeys.reduce((sum, day) => sum + (productDayStats.get(day)?.outflow ?? 0), 0);
+
+    return {
+      productId,
+      sku: String(row.sku),
+      name: String(row.name),
+      safetyStock: Number(row.safety_stock),
+      currentStock: Number(row.available_qty),
+      sevenDayNetDelta,
+      sevenDayOutflow,
+      recentDailyNetDeltas,
+    };
+  });
 }

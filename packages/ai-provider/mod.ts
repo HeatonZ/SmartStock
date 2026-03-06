@@ -9,10 +9,12 @@ export type ProductLogInput = {
   currentStock: number;
   sevenDayNetDelta: number;
   sevenDayOutflow: number;
+  recentDailyNetDeltas?: number[];
 };
 
 export type GenerateRestockInput = {
   products: ProductLogInput[];
+  requestId?: string;
 };
 
 export type AIProvider = {
@@ -20,7 +22,66 @@ export type AIProvider = {
 };
 
 function buildPrompt(input: GenerateRestockInput): string {
-  return `你是仓储分析助手。请根据最近7天库存变化给出补货建议，返回 JSON 数组，字段：productId, suggestedQty, reason。\n数据：${JSON.stringify(input.products)}`;
+  const compactProducts = input.products.map((product) => ({
+    productId: product.productId,
+    safetyStock: product.safetyStock,
+    currentStock: product.currentStock,
+    sevenDayOutflow: product.sevenDayOutflow,
+    recentDailyNetDeltas: product.recentDailyNetDeltas ?? [],
+  }));
+
+  return `你是仓储分析助手。请根据最近7天按天聚合的库存净变化给出补货建议，返回 JSON 数组，字段：productId, suggestedQty, reason。输入中的 recentDailyNetDeltas 是从最早到最新的7天净变化。\n数据：${JSON.stringify(compactProducts)}`;
+}
+
+function logPreview(value: unknown, maxLength = 3000): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...(truncated ${text.length - maxLength} chars)`;
+}
+
+function extractJsonText(raw: string): string {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+  return raw.trim();
+}
+
+function normalizeSuggestionList(input: unknown): RestockSuggestion[] {
+  const list = Array.isArray(input) ? input : [];
+  return list
+    .map((item) => ({
+      productId: String((item as { productId?: unknown })?.productId ?? ''),
+      suggestedQty: Number((item as { suggestedQty?: unknown })?.suggestedQty ?? 0),
+      reason: String((item as { reason?: unknown })?.reason ?? ''),
+    }))
+    .filter((item) => item.productId.length > 0 && Number.isFinite(item.suggestedQty));
+}
+
+function parseSuggestionResponse(rawContent: string): RestockSuggestion[] {
+  const content = extractJsonText(rawContent);
+  const parsed = JSON.parse(content);
+  if (Array.isArray(parsed)) {
+    return normalizeSuggestionList(parsed);
+  }
+
+  const candidates = [
+    (parsed as { suggestions?: unknown })?.suggestions,
+    (parsed as { replenishmentSuggestions?: unknown })?.replenishmentSuggestions,
+    (parsed as { restockSuggestions?: unknown })?.restockSuggestions,
+    (parsed as { items?: unknown })?.items,
+    (parsed as { data?: unknown })?.data,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeSuggestionList(candidate);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+
+  return [];
 }
 
 export function createProvider(config: {
@@ -39,6 +100,11 @@ export function createProvider(config: {
 
     return {
       async generateRestockSuggestions(input) {
+        const requestId = input.requestId ?? 'n/a';
+        const prompt = buildPrompt(input);
+        console.log(`[AI][${requestId}][deepseek] input=${logPreview(input.products)}`);
+        console.log(`[AI][${requestId}][deepseek] prompt=${logPreview(prompt)}`);
+
         const response = await fetch('https://api.deepseek.com/chat/completions', {
           method: 'POST',
           headers: {
@@ -47,7 +113,7 @@ export function createProvider(config: {
           },
           body: JSON.stringify({
             model: 'deepseek-chat',
-            messages: [{ role: 'user', content: buildPrompt(input) }],
+            messages: [{ role: 'user', content: prompt }],
             temperature: 0.2,
           }),
         });
@@ -58,7 +124,8 @@ export function createProvider(config: {
 
         const data = await response.json();
         const content = data.choices?.[0]?.message?.content;
-        return JSON.parse(content) as RestockSuggestion[];
+        console.log(`[AI][${requestId}][deepseek] rawOutput=${logPreview(content ?? '')}`);
+        return parseSuggestionResponse(content ?? '[]');
       },
     };
   }
@@ -71,28 +138,27 @@ export function createProvider(config: {
     const client = new OpenAI({
       apiKey: config.kimiApiKey,
       baseURL: 'https://api.moonshot.cn/v1',
-      timeout: 30_000,
+      timeout: 60_000,
       maxRetries: 1,
     });
 
     return {
       async generateRestockSuggestions(input) {
+        const requestId = input.requestId ?? 'n/a';
+        const prompt = buildPrompt(input);
+        console.log(`[AI][${requestId}][kimi] input=${logPreview(input.products)}`);
+        console.log(`[AI][${requestId}][kimi] prompt=${logPreview(prompt)}`);
+
         const completion = await client.chat.completions.create({
           model: config.kimiModel || 'moonshot-v1-8k',
-          messages: [{ role: 'user', content: buildPrompt(input) }],
+          messages: [{ role: 'user', content: prompt }],
           temperature: 1,
           response_format: { type: 'json_object' },
         });
 
         const content = completion.choices?.[0]?.message?.content ?? '[]';
-        const parsed = JSON.parse(content);
-        if (Array.isArray(parsed)) {
-          return parsed as RestockSuggestion[];
-        }
-        if (Array.isArray(parsed?.suggestions)) {
-          return parsed.suggestions as RestockSuggestion[];
-        }
-        return [];
+        console.log(`[AI][${requestId}][kimi] rawOutput=${logPreview(content)}`);
+        return parseSuggestionResponse(content);
       },
     };
   }
@@ -104,13 +170,18 @@ export function createProvider(config: {
 
     return {
       async generateRestockSuggestions(input) {
+        const requestId = input.requestId ?? 'n/a';
+        const prompt = buildPrompt(input);
+        console.log(`[AI][${requestId}][gemini] input=${logPreview(input.products)}`);
+        console.log(`[AI][${requestId}][gemini] prompt=${logPreview(prompt)}`);
+
         const response = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${config.geminiApiKey}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              contents: [{ parts: [{ text: buildPrompt(input) }] }],
+              contents: [{ parts: [{ text: prompt }] }],
             }),
           },
         );
@@ -121,7 +192,8 @@ export function createProvider(config: {
 
         const data = await response.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        return JSON.parse(text) as RestockSuggestion[];
+        console.log(`[AI][${requestId}][gemini] rawOutput=${logPreview(text ?? '')}`);
+        return parseSuggestionResponse(text ?? '[]');
       },
     };
   }
@@ -132,6 +204,8 @@ export function createProvider(config: {
 
   return {
     generateRestockSuggestions(input) {
+      const requestId = input.requestId ?? 'n/a';
+      console.log(`[AI][${requestId}][fallback] input=${logPreview(input.products)}`);
       return Promise.resolve(
         input.products
           .filter((product) => product.currentStock < product.safetyStock || product.sevenDayOutflow > 0)

@@ -16,6 +16,13 @@ export const aiRoutes = new Hono<{ Variables: Variables }>();
 
 aiRoutes.use('*', authMiddleware);
 
+function logPreview(value: unknown, maxLength = 3000): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...(truncated ${text.length - maxLength} chars)`;
+}
+
 aiRoutes.post('/restock-suggestions/generate', async (c) => {
   const requestId = crypto.randomUUID().slice(0, 8);
   const requestStart = Date.now();
@@ -41,12 +48,14 @@ aiRoutes.post('/restock-suggestions/generate', async (c) => {
     console.log(
       `[AI][${requestId}] stats loaded count=${stats.length} elapsedMs=${Date.now() - statsStart}`,
     );
+    console.log(`[AI][${requestId}] input.stats=${logPreview(stats)}`);
 
     const llmStart = Date.now();
-    const suggestions = await provider.generateRestockSuggestions({ products: stats });
+    const suggestions = await provider.generateRestockSuggestions({ products: stats, requestId });
     console.log(
       `[AI][${requestId}] provider response suggestions=${suggestions.length} elapsedMs=${Date.now() - llmStart}`,
     );
+    console.log(`[AI][${requestId}] output.suggestions=${logPreview(suggestions)}`);
 
     if (suggestions.length === 0) {
       console.log(`[AI][${requestId}] generate done empty totalMs=${Date.now() - requestStart}`);
@@ -66,6 +75,15 @@ aiRoutes.post('/restock-suggestions/generate', async (c) => {
         reason: bestSuggestion.reason,
       },
     });
+    console.log(
+      `[AI][${requestId}] output.bestSuggestion=${logPreview({
+        productId: bestSuggestion.productId,
+        sku: product?.sku ?? bestSuggestion.productId,
+        name: product?.name ?? '',
+        suggestedQty: bestSuggestion.suggestedQty,
+        reason: bestSuggestion.reason,
+      })}`,
+    );
     console.log(`[AI][${requestId}] generate done totalMs=${Date.now() - requestStart}`);
     return response;
   } catch (error) {
